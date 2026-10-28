@@ -1,0 +1,172 @@
+# XcodeGen spec for Catch the Fly: https://github.com/yonaskolb/XcodeGen (written for 2.46.0)
+#
+# Nobody runs this on a PC. The CI runner (.github/workflows/ios-build.yml) runs
+# `xcodegen generate` and gets CatchTheFly.xcodeproj, which is never committed.
+# See docs/MAC_FREE_BUILD.md.
+#
+# The rule: CI and Swift Playgrounds build the SAME files.
+#   - CatchTheFly = apps/CatchTheFly/** + FlyCore/Sources/FlyCore/*.swift in ONE module.
+#     scripts/to-ipad.ps1 copies FlyCore's sources into the Playgrounds project the
+#     same way, which is why app code never says `import FlyCore`.
+#   - DuoProbe = apps/DuoProbe/** only (to-ipad.ps1 doesn't copy FlyCore for it).
+#   Don't list individual files here. Folders are picked up whole, so new files
+#   that other engineers add get built without anyone touching this spec.
+#
+# Environment variables (the workflow always sets them; set them yourself for a local run):
+#   CTF_TEAM_ID                 Apple Developer Team ID (10 characters), may be empty for unsigned builds
+#   CTF_BUNDLE_ID_CATCHTHEFLY   e.g. com.example.catchthefly. Must match the App Store Connect app record
+#   CTF_BUNDLE_ID_DUOPROBE      e.g. com.example.duoprobe
+#   CTF_MARKETING_VERSION       e.g. 0.1.0 (CFBundleShortVersionString)
+
+name: CatchTheFly
+
+options:
+  # Format 2.46.0 knows (objectVersion 77). Xcode 27.1 opens it. Don't move to
+  # xcode27_0 until XcodeGen releases it (it's only on XcodeGen's unreleased "Next
+  # Version" as of 2026-10-26).
+  projectFormat: xcode16_0
+  xcodeVersion: "27.1"
+  deploymentTarget:
+    iOS: "26.0"
+  createIntermediateGroups: true
+
+settings:
+  base:
+    # Swift 6 language mode, as in Swift Playground 4.7 ("Swift 6"). If Playgrounds
+    # turns out to build our code in Swift 5 mode, CI is stricter than the iPad.
+    # That's on purpose: code that passes here also passes there.
+    SWIFT_VERSION: "6.0"
+    # Leave actor isolation at the SwiftPM default (nonisolated). Xcode 26+
+    # templates default to MainActor, but a .swiftpm package does not, and CI
+    # must match Playgrounds.
+    IPHONEOS_DEPLOYMENT_TARGET: "26.0"
+    TARGETED_DEVICE_FAMILY: "1"            # iPhone only
+    SUPPORTED_PLATFORMS: "iphoneos iphonesimulator"
+    SUPPORTS_MACCATALYST: NO
+    SUPPORTS_MAC_DESIGNED_FOR_IPHONE_IPAD: NO
+    SUPPORTS_XR_DESIGNED_FOR_IPHONE_IPAD: NO
+    DEVELOPMENT_TEAM: "${CTF_TEAM_ID}"
+    CODE_SIGN_STYLE: Automatic             # The upload job switches this to manual profiles
+    MARKETING_VERSION: "${CTF_MARKETING_VERSION}"
+    CURRENT_PROJECT_VERSION: "1"           # CI overrides this on the command line for every upload
+    ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+    ENABLE_PREVIEWS: NO
+    # Plain Swift, no ObjC bridging header, no generated asset symbols that the
+    # Playgrounds build wouldn't have either.
+    ASSETCATALOG_COMPILER_GENERATE_SWIFT_ASSET_SYMBOL_EXTENSIONS: NO
+  # IOS_27_1_SDK is defined ONLY in CI builds (the workflow refuses to build on
+  # anything but the iOS 27.1 SDK). Swift Playgrounds never defines it. So app code
+  # can write
+  #     #if IOS_27_1_SDK
+  #     if #available(iOS 27.1, *) { /* UIHingeInteraction, CameraCaptureAccessory… */ }
+  #     #endif
+  # in the same file that Playgrounds also builds: on the iPad the block is parsed
+  # but not compiled. See docs/MAC_FREE_BUILD.md, "Writing code for both builds".
+  configs:
+    Debug:
+      SWIFT_ACTIVE_COMPILATION_CONDITIONS: "DEBUG IOS_27_1_SDK"
+    Release:
+      SWIFT_ACTIVE_COMPILATION_CONDITIONS: "IOS_27_1_SDK"
+
+# Shared by both apps. Each target's `excludes` skips files that are never part of
+# an app (matching what to-ipad.ps1 skips: README/NOTES docs and .DS_Store).
+targetTemplates:
+  iPhoneApp:
+    type: application
+    platform: iOS
+    deploymentTarget: "26.0"
+
+targets:
+  CatchTheFly:
+    templates: [iPhoneApp]
+    sources:
+      - path: apps/CatchTheFly
+        optional: true                     # may still be empty, and git doesn't keep empty folders
+        excludes: ["**/*.md", "**/.DS_Store", "**/*.orig", "**/Package.swift"]
+      - path: FlyCore/Sources/FlyCore
+        group: FlyCore
+      # A placeholder app icon that CI generates only when apps/CatchTheFly has no
+      # AppIcon of its own (App Store Connect rejects uploads with no icon).
+      - path: build/ci-assets/CatchTheFly
+        optional: true
+    settings:
+      base:
+        PRODUCT_NAME: CatchTheFly
+        PRODUCT_BUNDLE_IDENTIFIER: "${CTF_BUNDLE_ID_CATCHTHEFLY}"
+    info:
+      path: build/xcodegen/CatchTheFly-Info.plist
+      properties:
+        CFBundleDisplayName: Catch the Fly
+        CFBundleDevelopmentRegion: en-GB
+        LSRequiresIPhoneOS: true
+        # A launch screen entry is what makes iOS run the app full screen
+        # instead of in the old letterboxed compatibility mode.
+        UILaunchScreen: {}
+        UIApplicationSceneManifest:
+          UIApplicationSupportsMultipleScenes: true   # Xcode's SwiftUI template default
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait
+          - UIInterfaceOrientationPortraitUpsideDown
+          - UIInterfaceOrientationLandscapeLeft
+          - UIInterfaceOrientationLandscapeRight
+        NSCameraUsageDescription: Catch the Fly uses the camera to show the room around you, so you can hunt the fly in it. Nothing is recorded or uploaded.
+        NSMotionUsageDescription: Catch the Fly uses motion data to follow how you turn and move the phone while you stalk the fly.
+        # No custom encryption, so TestFlight doesn't ask the export-compliance
+        # question for every build.
+        ITSAppUsesNonExemptEncryption: false
+
+  DuoProbe:
+    templates: [iPhoneApp]
+    sources:
+      - path: apps/DuoProbe
+        optional: true
+        excludes: ["**/*.md", "**/.DS_Store", "**/*.orig", "**/Package.swift"]
+      - path: build/ci-assets/DuoProbe
+        optional: true
+    settings:
+      base:
+        PRODUCT_NAME: DuoProbe
+        PRODUCT_BUNDLE_IDENTIFIER: "${CTF_BUNDLE_ID_DUOPROBE}"
+    info:
+      path: build/xcodegen/DuoProbe-Info.plist
+      properties:
+        CFBundleDisplayName: DuoProbe
+        CFBundleDevelopmentRegion: en-GB
+        LSRequiresIPhoneOS: true
+        UILaunchScreen: {}
+        UIApplicationSceneManifest:
+          UIApplicationSupportsMultipleScenes: true
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait
+          - UIInterfaceOrientationPortraitUpsideDown
+          - UIInterfaceOrientationLandscapeLeft
+          - UIInterfaceOrientationLandscapeRight
+        NSCameraUsageDescription: DuoProbe uses the cameras to test what this iPhone's cameras can see. Images stay on the phone unless you share the log.
+        NSMotionUsageDescription: DuoProbe uses motion data to measure how the phone moves while it opens and closes.
+        # The P9 clips are exported through the share sheet; its "Save Video"
+        # action needs this string or the app is terminated when it's tapped.
+        NSPhotoLibraryAddUsageDescription: DuoProbe saves its test clips to your photo library when you choose Save Video.
+        ITSAppUsesNonExemptEncryption: false
+
+# Explicit shared schemes: xcodebuild needs a scheme to archive.
+schemes:
+  CatchTheFly:
+    build:
+      targets:
+        CatchTheFly: all
+    run:
+      config: Debug
+    archive:
+      config: Release
+  DuoProbe:
+    build:
+      targets:
+        DuoProbe: all
+    run:
+      config: Debug
+    archive:
+      config: Release
+
+# FlyCoreTests is deliberately not here: FlyCore's tests run with `swift test` on
+# Linux and Windows (.github/workflows/flycore-tests.yml), which is cheaper than
+# macOS minutes and is what the studio's PC runs too.

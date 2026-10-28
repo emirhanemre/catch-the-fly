@@ -1,0 +1,119 @@
+# Ready-to-open Swift Playgrounds projects for the iPad, published on every push to main.
+#
+# What it does:
+#   1. scripts/pack-swiftpm.sh packs CatchTheFly.swiftpm and DuoProbe.swiftpm
+#      (the app's sources, FlyCore for the game, and the manifest from ipad/<App>/).
+#   2. Builds each packed project as it is, with Xcode on macos-latest (the iOS 26
+#      SDK, like Swift Playground 4.7), unsigned. That checks the AppleProductTypes
+#      manifest, which nothing else in CI sees.
+#   3. Publishes the zips as assets of the rolling pre-release "ipad-latest". On the
+#      iPad: Safari -> the repo's Releases -> download -> unzip in Files -> tap to
+#      open in Playgrounds. See docs/IPAD_DOWNLOAD.md.
+
+name: iPad packages
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "apps/**"
+      - "FlyCore/Sources/**"
+      - "ipad/**"
+      - "scripts/pack-swiftpm.sh"
+      - ".github/workflows/ipad-packages.yml"
+  pull_request:
+    paths:
+      - "apps/**"
+      - "FlyCore/Sources/**"
+      - "ipad/**"
+      - "scripts/pack-swiftpm.sh"
+      - ".github/workflows/ipad-packages.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ipad-packages-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    name: Build ${{ matrix.app }}.swiftpm (iOS 26 SDK, like Playgrounds)
+    runs-on: macos-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        app: [CatchTheFly, DuoProbe]
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+
+      - name: Pack
+        run: bash scripts/pack-swiftpm.sh "${{ matrix.app }}"
+
+      - name: Show Xcode, SDK and schemes
+        working-directory: build/swiftpm/${{ matrix.app }}.swiftpm
+        run: |
+          xcodebuild -version
+          echo "iOS SDK: $(xcrun --sdk iphoneos --show-sdk-version)"
+          xcodebuild -list
+
+      - name: Build for generic iOS device (unsigned)
+        working-directory: build/swiftpm/${{ matrix.app }}.swiftpm
+        run: |
+          set -o pipefail
+          mkdir -p "$GITHUB_WORKSPACE/build/logs"
+          xcodebuild build \
+            -scheme "${{ matrix.app }}" \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath "$RUNNER_TEMP/DerivedData" \
+            CODE_SIGNING_ALLOWED=NO \
+            2>&1 | tee "$GITHUB_WORKSPACE/build/logs/${{ matrix.app }}-swiftpm.log" | xcbeautify --renderer github-actions
+
+      - name: Keep build log
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: swiftpm-log-${{ matrix.app }}-${{ github.run_number }}
+          path: build/logs/
+          if-no-files-found: ignore
+          retention-days: 14
+
+  publish:
+    name: Publish to the ipad-latest release
+    needs: check
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+
+      - name: Pack both apps
+        run: |
+          bash scripts/pack-swiftpm.sh CatchTheFly
+          bash scripts/pack-swiftpm.sh DuoProbe
+
+      - name: Upload to the ipad-latest pre-release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          short="${GITHUB_SHA::7}"
+          when="$(date -u '+%Y-%m-%d %H:%M UTC')"
+          notes="Ready-to-open Swift Playgrounds projects, built from commit ${short} on ${when}.
+
+          On the iPad: download a zip, tap it in Files to unzip, then tap the .swiftpm to open it in Swift Playgrounds. Each download is a fresh copy, so delete or rename the old project first. Full steps: docs/IPAD_DOWNLOAD.md."
+          if ! gh release view ipad-latest >/dev/null 2>&1; then
+            gh release create ipad-latest --prerelease --target "$GITHUB_SHA" \
+              --title "iPad projects (latest)" --notes "$notes"
+          fi
+          # Move the tag to this commit, so the release's source links match the zips.
+          git tag -f ipad-latest "$GITHUB_SHA"
+          git push -f origin refs/tags/ipad-latest
+          gh release edit ipad-latest --notes "$notes"
+          gh release upload ipad-latest --clobber \
+            build/swiftpm/CatchTheFly.swiftpm.zip \
+            build/swiftpm/DuoProbe.swiftpm.zip
+          echo "::notice::Published CatchTheFly.swiftpm.zip and DuoProbe.swiftpm.zip from ${short}."

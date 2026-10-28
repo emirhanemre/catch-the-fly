@@ -1,0 +1,378 @@
+# iOS 27.1 SDK builds of the app layer, on GitHub's macOS runners. No Mac needed.
+# Setup and background: docs/MAC_FREE_BUILD.md.
+#
+# What it does:
+#   Every push / pull request that touches app code:
+#     generate CatchTheFly.xcodeproj from project.yml with XcodeGen, then build
+#     CatchTheFly and DuoProbe for "generic iOS device" with CODE_SIGNING_ALLOWED=NO.
+#     That type-checks and compiles every app-layer file against the iOS 27.1 SDK,
+#     with no Apple account involved. Apps whose folder has no .swift files yet are
+#     skipped.
+#   Manual run (Actions tab -> "iOS build" -> Run workflow, choose an app under "upload"):
+#     also signs that app, archives it, exports an IPA and uploads it to App Store
+#     Connect, where it shows up in TestFlight for internal testers after processing.
+#     Needs the secrets and variables listed below.
+#
+# Secrets (Settings -> Secrets and variables -> Actions -> Secrets), only for uploads:
+#   ASC_KEY_ID             App Store Connect API key ID, e.g. 2X9R4HXF34
+#   ASC_ISSUER_ID          Issuer ID shown above the keys list (a UUID)
+#   ASC_PRIVATE_KEY        The whole text of AuthKey_<KEY_ID>.p8, BEGIN/END lines included
+#   DIST_CERT_PRIVATE_KEY  An RSA private key (PEM) made once with openssl. The
+#                          Apple Distribution certificate is created from it via the API
+# Variables (same page -> Variables tab), not secret:
+#   CTF_TEAM_ID                 10-character Team ID (developer.apple.com -> Membership)
+#   CTF_BUNDLE_ID_CATCHTHEFLY   bundle ID of the Catch the Fly app record
+#   CTF_BUNDLE_ID_DUOPROBE      bundle ID of the DuoProbe app record
+#   CTF_MARKETING_VERSION       optional, default 0.1.0
+#
+# Runner: `xcode-27` is GitHub's Xcode 27 image (public preview since 2026-07-16).
+# On 2026-10-26 its image (20261022) has Xcode 27.0, 27.1 (default, 27A9275) and
+# 27.2 RC, with the iOS 27.1 SDK and an iPhone Duo simulator. It is a standard
+# runner: free on public repos, $0.062/min on private ones after the free quota.
+# The macos-26 / macos-latest images stop at Xcode 26.6, so they can't build 27.1.
+# When Xcode 27 moves into a GA image (likely macos-27), change runs-on and
+# nothing else.
+
+name: iOS build
+
+on:
+  push:
+    paths:
+      - "apps/**"
+      - "FlyCore/Sources/**"
+      - "project.yml"
+      - ".github/workflows/ios-build.yml"
+  pull_request:
+    paths:
+      - "apps/**"
+      - "FlyCore/Sources/**"
+      - "project.yml"
+      - ".github/workflows/ios-build.yml"
+  workflow_dispatch:
+    inputs:
+      upload:
+        description: "Also sign and upload this app to TestFlight"
+        type: choice
+        options: [none, DuoProbe, CatchTheFly]
+        default: none
+      marketing_version:
+        description: "Version shown in TestFlight (CFBundleShortVersionString). Empty = CTF_MARKETING_VERSION or 0.1.0"
+        type: string
+        required: false
+
+permissions:
+  contents: read
+
+concurrency:
+  # A newer push cancels an older compile check. Uploads are never cancelled.
+  group: ios-${{ github.ref }}-${{ github.event_name == 'workflow_dispatch' && github.run_id || 'ci' }}
+  cancel-in-progress: true
+
+env:
+  # The ONE place the Xcode version lives. Must exist on the runner as
+  # /Applications/Xcode_<version>.app (see the runner-images readme for xcode-27).
+  XCODE_VERSION: "27.1"
+  # The iOS SDK that version must provide. The build fails if it doesn't.
+  EXPECTED_IOS_SDK: "27.1"
+
+  XCODEGEN_VERSION: "2.46.0"
+  # sha256 of https://github.com/yonaskolb/XcodeGen/releases/download/2.46.0/xcodegen.zip (2026-10-26)
+  XCODEGEN_SHA256: "4d9e34b62172d645eed6457cac13fc222569974098ef4ee9c3368bedf0196806"
+  CODEMAGIC_CLI_VERSION: "0.70.0"
+
+  # Read by project.yml. Placeholders keep unsigned builds working before the
+  # variables exist.
+  CTF_TEAM_ID: ${{ vars.CTF_TEAM_ID }}
+  CTF_BUNDLE_ID_CATCHTHEFLY: ${{ vars.CTF_BUNDLE_ID_CATCHTHEFLY || 'com.example.catchthefly' }}
+  CTF_BUNDLE_ID_DUOPROBE: ${{ vars.CTF_BUNDLE_ID_DUOPROBE || 'com.example.duoprobe' }}
+  CTF_MARKETING_VERSION: ${{ inputs.marketing_version || vars.CTF_MARKETING_VERSION || '0.1.0' }}
+
+  PROJECT: CatchTheFly.xcodeproj
+
+jobs:
+  # Mimics the Swift Playgrounds build: iOS 26 SDK and no IOS_27_1_SDK flag, so it
+  # catches 27.x symbols that leak out of `#if IOS_27_1_SDK` and anything the old
+  # SDK doesn't have. Compile check only; nothing is signed or uploaded.
+  playgrounds-sdk:
+    name: Build with the iOS 26 SDK (like Swift Playgrounds)
+    if: github.event_name != 'workflow_dispatch' || inputs.upload == 'none'
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+
+      - name: Show Xcode and SDK
+        run: |
+          xcodebuild -version
+          echo "iOS SDK: $(xcrun --sdk iphoneos --show-sdk-version)"
+
+      - name: Install XcodeGen ${{ env.XCODEGEN_VERSION }}
+        run: |
+          cd "$RUNNER_TEMP"
+          curl -fsSL -o xcodegen.zip \
+            "https://github.com/yonaskolb/XcodeGen/releases/download/${XCODEGEN_VERSION}/xcodegen.zip"
+          echo "${XCODEGEN_SHA256}  xcodegen.zip" | shasum -a 256 -c -
+          unzip -q xcodegen.zip
+          echo "$RUNNER_TEMP/xcodegen/bin" >> "$GITHUB_PATH"
+
+      - name: Generate the Xcode project
+        run: xcodegen generate --spec project.yml
+
+      # SWIFT_ACTIVE_COMPILATION_CONDITIONS on the command line replaces the
+      # project's value, which drops IOS_27_1_SDK. No app icon is needed unsigned.
+      - name: Build for generic iOS device (unsigned, no IOS_27_1_SDK)
+        run: |
+          set -o pipefail
+          mkdir -p build/logs
+          for app in DuoProbe CatchTheFly; do
+            [ -n "$(find "apps/$app" -name '*.swift' -print -quit 2>/dev/null)" ] || continue
+            echo "::group::Build $app"
+            xcodebuild build \
+              -project "$PROJECT" \
+              -scheme "$app" \
+              -configuration Debug \
+              -destination 'generic/platform=iOS' \
+              -derivedDataPath build/DerivedData \
+              CODE_SIGNING_ALLOWED=NO \
+              SWIFT_ACTIVE_COMPILATION_CONDITIONS=DEBUG \
+              ASSETCATALOG_COMPILER_APPICON_NAME= \
+              2>&1 | tee "build/logs/$app-build-ios26.log" | xcbeautify --renderer github-actions
+            echo "::endgroup::"
+          done
+
+      - name: Keep build logs
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ios26-build-logs-${{ github.run_number }}
+          path: build/logs/
+          if-no-files-found: ignore
+          retention-days: 14
+
+  build:
+    name: Build${{ github.event_name == 'workflow_dispatch' && inputs.upload != 'none' && format(' and upload {0}', inputs.upload) || '' }}
+    runs-on: xcode-27
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+
+      - name: Select Xcode ${{ env.XCODE_VERSION }}
+        run: |
+          app="/Applications/Xcode_${XCODE_VERSION}.app"
+          if [ ! -d "$app" ]; then
+            echo "::error::$app isn't on this runner. Installed Xcodes:"
+            ls -d /Applications/Xcode*.app
+            exit 1
+          fi
+          sudo xcode-select -s "$app/Contents/Developer"
+          xcodebuild -version
+          sdk=$(xcrun --sdk iphoneos --show-sdk-version)
+          echo "iOS SDK: $sdk"
+          if [ "$sdk" != "$EXPECTED_IOS_SDK" ]; then
+            echo "::error::Expected the iOS $EXPECTED_IOS_SDK SDK, got $sdk."
+            exit 1
+          fi
+
+      - name: Install XcodeGen ${{ env.XCODEGEN_VERSION }}
+        run: |
+          cd "$RUNNER_TEMP"
+          curl -fsSL -o xcodegen.zip \
+            "https://github.com/yonaskolb/XcodeGen/releases/download/${XCODEGEN_VERSION}/xcodegen.zip"
+          echo "${XCODEGEN_SHA256}  xcodegen.zip" | shasum -a 256 -c -
+          unzip -q xcodegen.zip
+          echo "$RUNNER_TEMP/xcodegen/bin" >> "$GITHUB_PATH"
+
+      - name: Find apps that have sources
+        id: apps
+        run: |
+          apps=""
+          for app in DuoProbe CatchTheFly; do
+            if [ -d "apps/$app" ] && [ -n "$(find "apps/$app" -name '*.swift' -print -quit)" ]; then
+              apps="$apps $app"
+            else
+              echo "::notice::apps/$app has no .swift files yet, so it's skipped."
+            fi
+          done
+          echo "list=${apps# }" >> "$GITHUB_OUTPUT"
+          echo "Apps to build: ${apps:-none}"
+
+      # App Store Connect rejects uploads without an app icon. If an app has no
+      # AppIcon of its own yet, generate a plain 1024x1024 one under build/ (never
+      # in apps/, so the Playgrounds sources stay untouched).
+      - name: Placeholder app icons where missing
+        run: |
+          for app in DuoProbe CatchTheFly; do
+            if [ -n "$(find "apps/$app" \( -name 'AppIcon.appiconset' -o -name 'AppIcon.icon' \) -print -quit 2>/dev/null)" ]; then
+              echo "$app has its own AppIcon."
+              continue
+            fi
+            dir="build/ci-assets/$app/CIAssets.xcassets"
+            mkdir -p "$dir/AppIcon.appiconset"
+            echo '{"info":{"author":"xcode","version":1}}' > "$dir/Contents.json"
+            cat > "$dir/AppIcon.appiconset/Contents.json" <<'JSON'
+          {"images":[{"filename":"AppIcon.png","idiom":"universal","platform":"ios","size":"1024x1024"}],"info":{"author":"xcode","version":1}}
+          JSON
+            python3 - "$dir/AppIcon.appiconset/AppIcon.png" "$app" <<'PY'
+          import sys, zlib, struct
+          path, app = sys.argv[1], sys.argv[2]
+          rgb = bytes((40, 140, 70)) if app == "CatchTheFly" else bytes((60, 90, 160))
+          size = 1024
+          raw = b"".join(b"\x00" + rgb * size for _ in range(size))  # opaque RGB, no alpha
+          def chunk(kind, data):
+              return struct.pack(">I", len(data)) + kind + data + struct.pack(">I", zlib.crc32(kind + data) & 0xFFFFFFFF)
+          png = (b"\x89PNG\r\n\x1a\n"
+                 + chunk(b"IHDR", struct.pack(">IIBBBBB", size, size, 8, 2, 0, 0, 0))
+                 + chunk(b"IDAT", zlib.compress(raw, 9))
+                 + chunk(b"IEND", b""))
+          open(path, "wb").write(png)
+          PY
+            echo "Generated a placeholder icon for $app."
+          done
+
+      - name: Generate the Xcode project
+        run: |
+          xcodegen generate --spec project.yml
+          xcodebuild -list -project "$PROJECT"
+
+      # The compile check. No signing, no Apple account.
+      - name: Build for generic iOS device (unsigned)
+        if: steps.apps.outputs.list != ''
+        run: |
+          set -o pipefail
+          mkdir -p build/logs
+          for app in ${{ steps.apps.outputs.list }}; do
+            echo "::group::Build $app"
+            xcodebuild build \
+              -project "$PROJECT" \
+              -scheme "$app" \
+              -configuration Debug \
+              -destination 'generic/platform=iOS' \
+              -derivedDataPath build/DerivedData \
+              CODE_SIGNING_ALLOWED=NO \
+              2>&1 | tee "build/logs/$app-build.log" | xcbeautify --renderer github-actions
+            echo "::endgroup::"
+          done
+
+      # ---------------- Signed archive and TestFlight upload (manual runs only) ----------------
+
+      - name: Check upload settings
+        id: upload
+        if: github.event_name == 'workflow_dispatch' && inputs.upload != 'none'
+        env:
+          APP: ${{ inputs.upload }}
+          HAS_KEY_ID: ${{ secrets.ASC_KEY_ID != '' }}
+          HAS_ISSUER: ${{ secrets.ASC_ISSUER_ID != '' }}
+          HAS_P8: ${{ secrets.ASC_PRIVATE_KEY != '' }}
+          HAS_CERT_KEY: ${{ secrets.DIST_CERT_PRIVATE_KEY != '' }}
+        run: |
+          missing=""
+          [ "$HAS_KEY_ID" = "true" ]   || missing="$missing ASC_KEY_ID"
+          [ "$HAS_ISSUER" = "true" ]   || missing="$missing ASC_ISSUER_ID"
+          [ "$HAS_P8" = "true" ]       || missing="$missing ASC_PRIVATE_KEY"
+          [ "$HAS_CERT_KEY" = "true" ] || missing="$missing DIST_CERT_PRIVATE_KEY"
+          [ -n "$CTF_TEAM_ID" ]        || missing="$missing CTF_TEAM_ID(variable)"
+          if [ "$APP" = "CatchTheFly" ]; then bundle="$CTF_BUNDLE_ID_CATCHTHEFLY"; else bundle="$CTF_BUNDLE_ID_DUOPROBE"; fi
+          case "$bundle" in com.example.*) missing="$missing CTF_BUNDLE_ID_$(echo "$APP" | tr '[:lower:]' '[:upper:]')(variable)";; esac
+          if [ -n "$missing" ]; then
+            echo "::error::Can't upload $APP. Missing:$missing. See docs/MAC_FREE_BUILD.md, step 5."
+            exit 1
+          fi
+          case " ${{ steps.apps.outputs.list }} " in
+            *" $APP "*) ;;
+            *) echo "::error::apps/$APP has no Swift sources, so there's nothing to upload."; exit 1;;
+          esac
+          # Build number: UTC date.time, always increasing and never clashing with
+          # the small numbers Swift Playgrounds uses (e.g. 20261026.1532).
+          echo "build_number=$(date -u +%Y%m%d.%H%M)" >> "$GITHUB_OUTPUT"
+          echo "bundle_id=$bundle" >> "$GITHUB_OUTPUT"
+
+      - name: Install Codemagic CLI tools ${{ env.CODEMAGIC_CLI_VERSION }}
+        if: steps.upload.outcome == 'success'
+        run: |
+          python3 -m venv "$RUNNER_TEMP/cm"
+          "$RUNNER_TEMP/cm/bin/pip" install --quiet "codemagic-cli-tools==${CODEMAGIC_CLI_VERSION}"
+          echo "$RUNNER_TEMP/cm/bin" >> "$GITHUB_PATH"
+
+      # Signing without a Mac: codemagic-cli-tools talks to the App Store Connect API
+      # with our API key. It finds (or creates, from DIST_CERT_PRIVATE_KEY) the Apple
+      # Distribution certificate, finds or creates the bundle ID and an App Store
+      # provisioning profile, and puts them in a temporary keychain. Re-runs reuse
+      # the same certificate, so no orphan certificates pile up.
+      - name: Fetch signing files
+        if: steps.upload.outcome == 'success'
+        env:
+          APP_STORE_CONNECT_KEY_IDENTIFIER: ${{ secrets.ASC_KEY_ID }}
+          APP_STORE_CONNECT_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+          APP_STORE_CONNECT_PRIVATE_KEY: ${{ secrets.ASC_PRIVATE_KEY }}
+          CERTIFICATE_PRIVATE_KEY: ${{ secrets.DIST_CERT_PRIVATE_KEY }}
+        run: |
+          keychain initialize
+          app-store-connect fetch-signing-files "${{ steps.upload.outputs.bundle_id }}" \
+            --platform IOS \
+            --type IOS_APP_STORE \
+            --strict-match-identifier \
+            --create
+          keychain add-certificates
+          # Switch the generated project to manual signing with those profiles and
+          # write $HOME/export_options.plist for the export step.
+          xcode-project use-profiles --project "$PROJECT" --archive-method app-store
+          cat "$HOME/export_options.plist"
+
+      - name: Archive ${{ inputs.upload }}
+        if: steps.upload.outcome == 'success'
+        env:
+          APP: ${{ inputs.upload }}
+          BUILD_NUMBER: ${{ steps.upload.outputs.build_number }}
+        run: |
+          set -o pipefail
+          xcodebuild archive \
+            -project "$PROJECT" \
+            -scheme "$APP" \
+            -configuration Release \
+            -destination 'generic/platform=iOS' \
+            -archivePath "$RUNNER_TEMP/$APP.xcarchive" \
+            -derivedDataPath build/DerivedData \
+            CURRENT_PROJECT_VERSION="$BUILD_NUMBER" \
+            MARKETING_VERSION="$CTF_MARKETING_VERSION" \
+            2>&1 | tee "build/logs/$APP-archive.log" | xcbeautify --renderer github-actions
+
+      - name: Export IPA
+        if: steps.upload.outcome == 'success'
+        env:
+          APP: ${{ inputs.upload }}
+        run: |
+          set -o pipefail
+          xcodebuild -exportArchive \
+            -archivePath "$RUNNER_TEMP/$APP.xcarchive" \
+            -exportOptionsPlist "$HOME/export_options.plist" \
+            -exportPath "$RUNNER_TEMP/ipa" \
+            2>&1 | tee "build/logs/$APP-export.log" | xcbeautify --renderer github-actions
+          ls -l "$RUNNER_TEMP/ipa"
+
+      # Upload only. Internal testers (the Duo tester) get the build in TestFlight once
+      # Apple has processed it (usually 5 to 30 minutes). No --testflight flag:
+      # that would submit it for external Beta App Review, which we don't need.
+      - name: Upload to App Store Connect
+        if: steps.upload.outcome == 'success'
+        env:
+          APP_STORE_CONNECT_KEY_IDENTIFIER: ${{ secrets.ASC_KEY_ID }}
+          APP_STORE_CONNECT_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+          APP_STORE_CONNECT_PRIVATE_KEY: ${{ secrets.ASC_PRIVATE_KEY }}
+        run: |
+          ipa=$(find "$RUNNER_TEMP/ipa" -name '*.ipa' -print -quit)
+          [ -n "$ipa" ] || { echo "::error::No .ipa was exported."; exit 1; }
+          app-store-connect publish --path "$ipa"
+          echo "::notice::Uploaded ${{ inputs.upload }} ${CTF_MARKETING_VERSION} (${{ steps.upload.outputs.build_number }}). It appears in TestFlight after Apple's processing."
+
+      - name: Remove the temporary keychain
+        if: always() && steps.upload.outcome == 'success'
+        run: keychain use-login || true
+
+      - name: Keep build logs
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ios-build-logs-${{ github.run_number }}
+          path: build/logs/
+          if-no-files-found: ignore
+          retention-days: 14

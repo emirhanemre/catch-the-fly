@@ -1,0 +1,125 @@
+# FlyCore tests on every push and pull request, on Linux and Windows.
+#
+# Why these choices (checked 2026-10-26):
+# - Linux runs in the official Swift Docker image (Docker Hub "swift", maintained by
+#   the Swift project). No setup action to trust, and the image tag pins the exact
+#   toolchain. 6.4.1 (released 2026-10-12) is the current release, and Xcode 27.1
+#   ships Swift 6.4, so this is the compiler the Duo build uses. 6.2.4 is a
+#   conservative floor for Swift Playground 4.7 on the iPad, whose exact Swift
+#   version is unverified (it says "Swift 6 and the iOS 26 SDK").
+# - Windows uses compnerd/gha-setup-swift, the action the Swift-on-Windows
+#   maintainers keep, which installs the swift.org toolchain. It's pinned to a
+#   commit, not a moving tag, because it's third-party code.
+# - Linux and Windows minutes are cheap ($0.006 and $0.010 a minute on private
+#   repos, free on public ones), so every push gets a real compile + test.
+#
+# Note: `swift test` fails while FlyCore/Tests/FlyCoreTests/ is empty (git doesn't
+# keep empty folders, and SwiftPM wants the declared test target to have sources).
+# It goes green once the first test file lands.
+
+name: FlyCore tests
+
+on:
+  push:
+    paths:
+      - "FlyCore/**"
+      - "apps/**"
+      - ".github/workflows/flycore-tests.yml"
+  pull_request:
+    paths:
+      - "FlyCore/**"
+      - "apps/**"
+      - ".github/workflows/flycore-tests.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: flycore-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  linux:
+    name: Linux, Swift ${{ matrix.swift }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        swift: ["6.4.1", "6.2.4"]
+    container:
+      image: swift:${{ matrix.swift }}-noble
+    defaults:
+      run:
+        working-directory: FlyCore
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+
+      - name: Show toolchain
+        run: swift --version
+
+      # CLAUDE.md rule: FlyCore imports Foundation only (it must build on Windows).
+      - name: Check FlyCore imports Foundation only
+        working-directory: FlyCore/Sources
+        shell: bash
+        run: |
+          bad=$(grep -rnE '^[[:space:]]*(@[A-Za-z_]+[[:space:]]+)*import[[:space:]]+' --include='*.swift' . \
+                | grep -vE 'import[[:space:]]+Foundation[[:space:]]*$' || true)
+          if [ -n "$bad" ]; then
+            echo "::error::FlyCore must import Foundation only. Found:"
+            echo "$bad"
+            exit 1
+          fi
+          echo "OK: Foundation only."
+
+      - name: Build and test
+        run: swift test --parallel
+
+  windows:
+    name: Windows, Swift 6.4.1
+    # windows-latest is Windows Server 2025 with Visual Studio 2026 (runner-images,
+    # 2026-10-26). If the Swift installer can't find the MSVC toolchain there,
+    # change this to windows-2022.
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: compnerd/gha-setup-swift@9ff1ee4c44888c5817fc14d1b257ac8cabb4935f # v0.5.1
+        with:
+          swift-version: swift-6.4.1-release
+          swift-build: 6.4.1-RELEASE
+
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+
+      - name: Build and test
+        working-directory: FlyCore
+        run: |
+          swift --version
+          swift test
+
+  # Free, fast syntax check of the app layer on Linux, the CI version of CLAUDE.md
+  # rule 4 (`swiftc -parse`). It catches typos in seconds without spending macOS
+  # minutes. It does NOT type-check: ios-build.yml does that.
+  app-parse:
+    name: Parse app-layer Swift
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    container:
+      image: swift:6.4.1-noble
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+      - name: swiftc -parse apps/**/*.swift
+        shell: bash
+        run: |
+          shopt -s globstar nullglob
+          files=(apps/**/*.swift)
+          if [ ${#files[@]} -eq 0 ]; then
+            echo "No app-layer Swift files yet. Nothing to parse."
+            exit 0
+          fi
+          status=0
+          for f in "${files[@]}"; do
+            swiftc -parse "$f" || { echo "::error file=$f::swiftc -parse failed"; status=1; }
+          done
+          echo "Parsed ${#files[@]} file(s)."
+          exit $status
